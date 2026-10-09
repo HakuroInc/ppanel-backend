@@ -1,0 +1,38 @@
+# Managed by .github/workflows/deploy-production.yml in AS207299/ppanel-backend.
+# The workflow only changes PPANEL_TAG in .env; edit everything else here.
+name: ppanel
+
+services:
+  ppanel:
+    image: ${PPANEL_IMAGE}:${PPANEL_TAG}
+    container_name: ppanel-server
+    # Loopback only: the public entry is the Cloudflare tunnel.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./etc/ppanel.yaml:/app/etc/ppanel.yaml
+      - ./logs:/app/logs
+      - ./cache:/app/cache
+    # Read only while etc/ppanel.yaml has no JwtAuth.AccessSecret yet, i.e. on
+    # the first start against a database (docs/guide/config.md).
+    environment:
+      PPANEL_DB: ${PPANEL_DB:-}
+      PPANEL_REDIS: ${PPANEL_REDIS:-redis://redis:6379/0}
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "/app/ppanel", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: ppanel-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./redis:/data
+    restart: unless-stopped
