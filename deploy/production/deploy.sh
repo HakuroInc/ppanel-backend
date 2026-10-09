@@ -1,16 +1,24 @@
 #!/bin/sh
-# Production deploy entry point, run as root. Reached only through the forced
-# command of the CI deploy key in ~ubuntu/.ssh/authorized_keys:
+# Production deploy, run as root (root:root 755 at /opt/ppanel/deploy.sh).
+#
+#   deploy.sh <40-char commit sha> < ppanel-linux-arm64
+#
+# CI reaches it only through the forced command of its deploy key in
+# ~ubuntu/.ssh/authorized_keys:
 #   restrict,command="sudo -n /opt/ppanel/deploy.sh \"$SSH_ORIGINAL_COMMAND\"" ssh-ed25519 ...
-#   $1    = full 40-char commit sha to deploy (the client's SSH command)
-#   stdin = short-lived GHCR token of the workflow run
+# stdin carries the binary the runner cross-compiled; it is wrapped into an
+# image with the root-owned /opt/ppanel/Dockerfile.runtime.
+#
+# Rolling back by hand: images of the current and previous deploy are kept,
+#   sudo sed -i 's/^PPANEL_TAG=.*/PPANEL_TAG=<sha>/' /opt/ppanel/.env
+#   cd /opt/ppanel && sudo docker compose up -d
 set -eu
 
 APP_DIR=/opt/ppanel
+MAX_BYTES=314572800 # 300 MiB
 cd "$APP_DIR"
 
 SHA="${1:-}"
-# Exactly 40 lowercase hex characters, nothing else (no newlines either).
 case "$SHA" in
 '' | *[!0-9a-f]*) SHA_OK=0 ;;
 *) [ "${#SHA}" -eq 40 ] && SHA_OK=1 || SHA_OK=0 ;;
@@ -21,33 +29,37 @@ if [ "$SHA_OK" != 1 ]; then
 fi
 
 exec 9>"$APP_DIR/.deploy.lock"
-flock -w 600 9 || { echo "deploy: another deploy is running" >&2; exit 1; }
-
-IFS= read -r GHCR_TOKEN || true
+flock -w 1800 9 || { echo "deploy: another deploy is running" >&2; exit 1; }
 
 env_get() { sed -n "s/^$1=//p" .env | tail -n 1; }
 set_tag() { sed -i "s/^PPANEL_TAG=.*/PPANEL_TAG=$1/" .env; }
 
+IMAGE="$(env_get PPANEL_IMAGE)"
 PREV_TAG="$(env_get PPANEL_TAG)"
 REQUIRE_HEALTHY="$(env_get DEPLOY_REQUIRE_HEALTHY)"
 HEALTH_TIMEOUT="$(env_get DEPLOY_HEALTH_TIMEOUT)"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 
-# Credentials live only for this run: the token expires with the job anyway.
-DOCKER_CONFIG="$(mktemp -d)"
-export DOCKER_CONFIG
-trap 'rm -rf "$DOCKER_CONFIG"' EXIT
-if [ -n "${GHCR_TOKEN:-}" ]; then
-	printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u ci --password-stdin >/dev/null
-fi
+CTX="$(mktemp -d)"
+trap 'rm -rf "$CTX"' EXIT
+head -c "$MAX_BYTES" > "$CTX/ppanel"
+# ELF magic, 64-bit, little endian, e_machine 0x00b7 (AArch64).
+hdr="$(od -An -tx1 -N20 "$CTX/ppanel" | tr -d ' \n')"
+case "$hdr" in
+7f454c460201*b700) ;;
+*)
+	echo "deploy: stdin is not a linux/arm64 ELF executable" >&2
+	exit 2
+	;;
+esac
+chmod 755 "$CTX/ppanel"
+cp "$APP_DIR/Dockerfile.runtime" "$CTX/Dockerfile"
+
+echo "deploy: building image $IMAGE:$SHA ($(wc -c < "$CTX/ppanel") bytes)"
+docker build -q -t "$IMAGE:$SHA" "$CTX" >/dev/null
 
 echo "deploy: $PREV_TAG -> $SHA"
 set_tag "$SHA"
-if ! docker compose pull ppanel; then
-	set_tag "$PREV_TAG"
-	echo "deploy: pull failed, kept $PREV_TAG" >&2
-	exit 1
-fi
 docker compose up -d --remove-orphans
 
 health() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' ppanel-server 2>/dev/null || echo missing; }
@@ -59,7 +71,7 @@ while [ "$status" = starting ] && [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
 done
 echo "deploy: container status after ${waited}s: $status"
 
-if [ "$status" != healthy ] && [ "$REQUIRE_HEALTHY" = 1 ]; then
+if [ "$status" != healthy ] && [ "$REQUIRE_HEALTHY" = 1 ] && [ "$PREV_TAG" != none ]; then
 	echo "deploy: $SHA is not healthy, rolling back to $PREV_TAG" >&2
 	docker compose logs --tail 80 ppanel >&2 || true
 	set_tag "$PREV_TAG"
@@ -67,13 +79,12 @@ if [ "$status" != healthy ] && [ "$REQUIRE_HEALTHY" = 1 ]; then
 	exit 1
 fi
 if [ "$status" != healthy ]; then
-	echo "deploy: WARNING not healthy (DEPLOY_REQUIRE_HEALTHY=0, kept anyway)"
+	echo "deploy: WARNING not healthy (kept anyway; see DEPLOY_REQUIRE_HEALTHY)"
 	docker compose logs --tail 30 ppanel || true
 fi
 
 # Keep the running and the previous image (the rollback target), drop the
 # older ppanel images only; other stacks on this host are left alone.
-IMAGE="$(env_get PPANEL_IMAGE)"
 docker images "$IMAGE" --format '{{.Tag}}' | grep -Ev "^($SHA|$PREV_TAG)\$" |
 	while read -r old; do docker rmi "$IMAGE:$old" >/dev/null 2>&1 || true; done
 echo "deploy: done ($SHA)"

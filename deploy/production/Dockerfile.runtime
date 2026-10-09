@@ -1,0 +1,22 @@
+# Runtime image of the production host, built there by deploy.sh around the
+# linux/arm64 binary the CI runner cross-compiled. The final stage mirrors the
+# repository Dockerfile; only the compile step moved to CI.
+FROM alpine:3.22 AS base
+RUN apk add --no-cache tzdata ca-certificates && \
+    mkdir -p /out/etc /out/logs /out/cache && : > /out/etc/ppanel.yaml
+
+FROM scratch
+COPY --from=base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=base /usr/share/zoneinfo/Asia/Shanghai /usr/share/zoneinfo/Asia/Shanghai
+ENV TZ=Asia/Shanghai
+COPY ppanel /app/ppanel
+COPY --from=base --chown=65532:65532 /out/etc /app/etc
+COPY --from=base --chown=65532:65532 /out/logs /app/logs
+COPY --from=base --chown=65532:65532 /out/cache /app/cache
+WORKDIR /app
+USER 65532:65532
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/app/ppanel", "healthcheck"]
+ENTRYPOINT ["/app/ppanel"]
+CMD ["run", "--config", "etc/ppanel.yaml"]

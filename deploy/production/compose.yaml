@@ -1,10 +1,12 @@
 # Managed by .github/workflows/deploy-production.yml in AS207299/ppanel-backend.
-# The workflow only changes PPANEL_TAG in .env; edit everything else here.
+# deploy.sh only changes PPANEL_TAG in .env; edit everything else here.
 name: ppanel
 
 services:
   ppanel:
     image: ${PPANEL_IMAGE}:${PPANEL_TAG}
+    # Built on this host by deploy.sh; never pulled from a registry.
+    pull_policy: never
     container_name: ppanel-server
     # Loopback only: the public entry is the Cloudflare tunnel.
     ports:

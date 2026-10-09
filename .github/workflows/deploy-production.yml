@@ -1,8 +1,8 @@
 name: Deploy production
 
-# Every push to the production branch is checked, built for the production
-# host (linux/arm64) and rolled out there. The host side lives in /opt/ppanel
-# (compose.yaml, .env, deploy.sh); see docs/deploy-production.md.
+# Every push to the production branch is cross-compiled for the production
+# host (linux/arm64) on the organization's self-hosted runner and shipped
+# there over SSH; see docs/deploy-production.md. No tests run here on purpose.
 on:
   push:
     branches: [production]
@@ -11,90 +11,55 @@ on:
 permissions:
   contents: read
 
-# One rollout at a time, in push order; a newer push waits rather than
-# cancelling a deploy halfway.
+# One rollout at a time, in push order.
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
 jobs:
-  # Same gate as ci.yml and nightly.yml: nothing reaches the host unless it
-  # passes.
-  verify:
-    uses: ./.github/workflows/checks.yml
-
-  build:
-    name: Build arm64 image
-    needs: verify
-    # Native arm64 runner: the host is aarch64, and QEMU would take far longer.
-    runs-on: ubuntu-24.04-arm
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
+  deploy:
+    name: Build and roll out
+    if: github.ref == 'refs/heads/production'
+    runs-on: [self-hosted, Linux, X64]
+    environment: production
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Registry paths must be lowercase; the owner (AS207299) is not.
-      - name: Resolve build metadata
-        id: meta
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Same flags as the repository Dockerfile; the host wraps the binary
+      # into the image (deploy/production/Dockerfile.runtime).
+      - name: Build linux/arm64 binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
         run: |
-          owner="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
-          echo "image=ghcr.io/${owner}/ppanel-backend" >> "$GITHUB_OUTPUT"
-          echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          echo "VERSION=production-${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+          LDFLAGS="$(VERSION="production-${GITHUB_SHA::8}" CHANNEL=stable \
+            BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" sh script/ldflags.sh)"
+          go build -trimpath -ldflags="$LDFLAGS" -o "$RUNNER_TEMP/ppanel" main.go
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build and push the production image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/arm64
-          push: true
-          cache-from: type=gha,scope=production
-          cache-to: type=gha,mode=max,scope=production
-          build-args: |
-            VERSION=${{ env.VERSION }}
-            CHANNEL=production
-            BUILD_TIME=${{ env.BUILD_TIME }}
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ github.sha }}
-            ${{ steps.meta.outputs.image }}:production
-
-  deploy:
-    name: Roll out to the production host
-    needs: build
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      packages: read
-    steps:
       # The deploy key is pinned to /opt/ppanel/deploy.sh by a forced command
-      # on the host, so all it can do is deploy: the commit sha travels as the
-      # SSH command and this job's short-lived registry token on stdin.
+      # on the host: the commit sha travels as the SSH command, the binary on
+      # stdin.
       - name: Deploy ${{ github.sha }}
         env:
           SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
           SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key \
-            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            -o ServerAliveInterval=15 "$SSH_HOST" "$GITHUB_SHA"
+          key="$RUNNER_TEMP/deploy_key"
+          hosts="$RUNNER_TEMP/known_hosts"
+          trap 'rm -f "$key" "$hosts"' EXIT
+          (umask 077; printf '%s\n' "$SSH_KEY" > "$key")
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$hosts"
+          ssh -F /dev/null -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$hosts" \
+            -o ServerAliveInterval=15 "$SSH_HOST" "$GITHUB_SHA" < "$RUNNER_TEMP/ppanel"
+          rm -f "$RUNNER_TEMP/ppanel"
