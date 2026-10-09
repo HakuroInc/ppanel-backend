@@ -1,7 +1,7 @@
 name: Deploy production
 
 # Every push to the production branch is cross-compiled for the production
-# host (linux/arm64) on the organization's self-hosted runner and shipped
+# host (linux/arm64) on a GitHub-hosted runner and shipped
 # there over SSH; see docs/deploy-production.md. No tests run here on purpose.
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
   deploy:
     name: Build and roll out
     if: github.ref == 'refs/heads/production'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 30
     steps:

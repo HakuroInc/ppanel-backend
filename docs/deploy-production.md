@@ -2,7 +2,7 @@
 
 推送到 `production` 分支即自动上线，流程见 `.github/workflows/deploy-production.yml`，不跑测试：
 
-1. 组织的自托管 runner（标签 `self-hosted, Linux, X64`）检出代码，交叉编译 linux/arm64 二进制
+1. GitHub 托管 runner（`ubuntu-latest`，公开仓库免费）检出代码，交叉编译 linux/arm64 二进制
    （与仓库 Dockerfile 相同的 ldflags，`VERSION=production-<sha8>`，`CHANNEL=stable`）。
 2. 用专用部署密钥 SSH 到生产机，二进制走 stdin，commit sha 作为命令参数；
    主机执行 `/opt/ppanel/deploy.sh <sha>`：校验是 arm64 ELF，套上 `Dockerfile.runtime`
@@ -34,9 +34,7 @@ restrict,command="sudo -n /opt/ppanel/deploy.sh \"$SSH_ORIGINAL_COMMAND\"" ssh-e
 - Environment `production`（仅允许 `production` 分支）中的 secrets：
   `PROD_SSH_KEY`（部署私钥）、`PROD_SSH_HOST`（`ubuntu@140.83.81.248`）、
   `PROD_SSH_KNOWN_HOSTS`（主机 ed25519 公钥，`SHA256:B7tdgZ0c0yiGqIM+OKSGl3mGk2vFu3OKAh7uBhgM+IU`）。
-- 组织 runner 组 Default 需允许公开仓库使用；由于仓库公开，来自外部贡献者的 fork PR
-  工作流需要人工批准（仓库设置 `all_external_contributors`），避免陌生代码跑在自托管 runner 上。
-- runner 只需 git、curl、ssh；Go 由 `actions/setup-go` 下载，不需要 Docker。
+- 外部贡献者的 fork PR 工作流需要人工批准（仓库设置 `all_external_contributors`）。
 
 ## 接入数据库后
 
